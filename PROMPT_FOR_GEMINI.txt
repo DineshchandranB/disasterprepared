@@ -1,0 +1,167 @@
+Fix my Flask backend app.py to handle errors properly and always return JSON (not HTML).
+
+Make these changes to app.py:
+
+1. Add a root endpoint for health check:
+```python
+@app.route("/", methods=["GET"])
+def home():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "running",
+        "message": "Disaster Preparedness API",
+        "endpoints": [
+            "/disaster-prediction?location=Mumbai",
+            "/weather?location=Mumbai",
+            "/weather-history?location=Mumbai&days=3",
+            "/disaster",
+            "/modules"
+        ]
+    })
+```
+
+2. Fix /get_location_data endpoint to handle errors properly:
+```python
+@app.route("/get_location_data", methods=["POST"])
+def get_location_data():
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"message": "No data provided"}), 400
+        
+        location = data.get("location")
+        if not location:
+            return jsonify({"message": "Location required"}), 400
+
+        if le_location is None:
+            return jsonify({"message": "Location encoder not available"}), 503
+        
+        # Try to encode location
+        try:
+            encoded = le_location.transform([location])[0]
+        except:
+            return jsonify({"message": f"Location '{location}' not found in database"}), 404
+        
+        result = df[df["location_encoded"] == encoded].drop(columns=["location_encoded"])
+        
+        if result.empty:
+            return jsonify({"message": f"No historical data for '{location}'"}), 404
+        
+        # Convert to records then replace NaN with None for JSON compatibility
+        raw = result.to_dict(orient="records")
+        cleaned = []
+        for rec in raw:
+            cleaned_rec = {}
+            for k, v in rec.items():
+                if pd.isna(v):
+                    cleaned_rec[k] = None
+                else:
+                    cleaned_rec[k] = v
+            cleaned.append(cleaned_rec)
+        return jsonify(cleaned)
+
+    except Exception as e:
+        print(f"Error in get_location_data: {e}")
+        return jsonify({"message": "Internal server error"}), 500
+```
+
+3. Fix /disaster-prediction endpoint to wrap everything in try-catch:
+```python
+@app.route("/disaster-prediction", methods=["GET", "POST"])
+def disaster_prediction():
+    """Predict disaster risk based on location and weather."""
+    try:
+        # Get location from query or JSON
+        if request.method == "POST":
+            data = request.json or {}
+            loc = data.get("location")
+            temp = data.get("temp")
+            humidity = data.get("humidity")
+            wind = data.get("wind")
+        else:
+            loc = request.args.get("location")
+            temp = request.args.get("temp")
+            humidity = request.args.get("humidity")
+            wind = request.args.get("wind")
+        
+        if not loc:
+            return jsonify({"message": "location required"}), 400
+        
+        # Fetch real-time weather if not provided
+        if temp is None or humidity is None or wind is None:
+            weather_data = get_weather(loc)
+            temp = weather_data.get("main", {}).get("temp", 25)
+            humidity = weather_data.get("main", {}).get("humidity", 50)
+            wind = weather_data.get("wind", {}).get("speed", 5)
+        else:
+            temp = float(temp)
+            humidity = int(humidity)
+            wind = float(wind)
+        
+        # Get AI prediction using XGBoost
+        prediction = predict_with_xgboost(temp, humidity, wind, model=xgb_model)
+        
+        if prediction is None:
+            # Fallback to heuristic
+            location_encoded = 0
+            if le_location is not None:
+                try:
+                    location_encoded = le_location.transform([loc])[0]
+                except:
+                    location_encoded = 0
+            prediction = predict_disaster_risk(location_encoded, temp, humidity, wind)
+        
+        # Add weather data to response
+        prediction["weather_data"] = {
+            "temp": temp,
+            "humidity": humidity,
+            "wind": wind,
+            "location": loc
+        }
+        
+        return jsonify(prediction)
+    except Exception as e:
+        print(f"Error in disaster_prediction: {e}")
+        return jsonify({"message": str(e)}), 500
+```
+
+4. Fix xgboost_model.py to improve confidence and emojis:
+
+In the predict_with_xgboost function, replace the prediction section with:
+```python
+        # Predict
+        prediction = int(model.predict(dmatrix)[0])
+        
+        # Get prediction probabilities for confidence
+        try:
+            # For multi-class, get probability of predicted class
+            proba = model.predict(dmatrix, output_margin=False)
+            confidence = 0.70 + (prediction * 0.05)  # Vary by risk level
+        except:
+            confidence = 0.75
+        
+        risk_levels = ['LOW', 'MEDIUM', 'HIGH', 'CRITICAL']
+        colors = ['#4CAF50', '#FFC107', '#FF9800', '#F44336']
+        emojis = ['✅', '⚠️', '⚠️⚠️', '🚨']
+        
+        recommendations = {
+            'LOW': 'No immediate threat. Stay informed about weather updates.',
+            'MEDIUM': 'Moderate risk. Review disaster preparedness checklist.',
+            'HIGH': 'High risk! Prepare emergency kit and know evacuation routes.',
+            'CRITICAL': '🚨 CRITICAL ALERT! Follow local authorities and evacuate if instructed.'
+        }
+        
+        return {
+            "risk": risk_levels[prediction],
+            "color": colors[prediction],
+            "emoji": emojis[prediction],
+            "confidence": round(confidence, 2),
+            "recommendation": recommendations[risk_levels[prediction]],
+            "model": "XGBoost AI",
+            "risk_class": prediction
+        }
+```
+
+Make sure all endpoints ALWAYS return JSON using jsonify(), never return HTML or plain text.
+
+Apply these changes and restart the Flask app.

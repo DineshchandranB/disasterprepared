@@ -1,51 +1,102 @@
 from flask import Flask, request, jsonify
 import pickle
 import pandas as pd
+import os
 from flask_cors import CORS
 from weather import get_weather, get_weather_history
-from prediction import predict_disaster_risk, train_prediction_model
-from xgboost_model import predict_with_xgboost, train_xgboost_model
+from prediction import predict_disaster_risk
 
 app = Flask(__name__)
 CORS(app)
 
-# Load AI knowledge (optional — files must exist)
+# Load AI knowledge for historical data only
 try:
-    df = pickle.load(open("models/disaster_knowledge.pkl", "rb"))
-except Exception:
-    df = pd.DataFrame()
-
-try:
-    le_location = pickle.load(open("models/location_encoder.pkl", "rb"))
-except Exception:
-    le_location = None
-
-# Train disaster prediction model on startup
-try:
-    train_prediction_model(df)
-    print("✅ Disaster predictor model trained")
+    df = pickle.load(open("models/disaster_knowledge_clean.pkl", "rb"))
+    print(f"[OK] Loaded {len(df)} disaster records")
 except Exception as e:
-    print(f"⚠ Warning: could not train predictor: {e}")
+    print(f"[WARNING] Could not load clean data: {e}")
+    try:
+        df = pickle.load(open("models/disaster_knowledge.pkl", "rb"))
+        print(f"[OK] Loaded original data: {len(df)} records")
+    except:
+        df = pd.DataFrame()
 
-# Train XGBoost AI model on startup
 try:
-    train_xgboost_model()
-    print("✅ XGBoost AI model trained")
+    le_location = pickle.load(open("models/state_encoder.pkl", "rb"))
+    print(f"[OK] Loaded state encoder with {len(le_location.classes_)} states")
+    print(f"[INFO] Available states: {list(le_location.classes_)[:10]}...")
 except Exception as e:
-    print(f"⚠ Warning: could not train XGBoost: {e}")
+    print(f"[WARNING] Could not load state encoder: {e}")
+    try:
+        le_location = pickle.load(open("models/location_encoder.pkl", "rb"))
+        print(f"[OK] Loaded location encoder")
+    except:
+        le_location = None
+
+
+@app.route("/", methods=["GET"])
+def home():
+    """Health check endpoint"""
+    return jsonify({
+        "status": "running",
+        "message": "Disaster Preparedness API",
+        "endpoints": [
+            "/disaster-prediction?location=Mumbai",
+            "/weather?location=Mumbai",
+            "/weather-history?location=Mumbai&days=3",
+            "/disaster",
+            "/modules"
+        ]
+    })
 
 
 @app.route("/get_location_data", methods=["POST"])
 def get_location_data():
-    data = request.json
-    location = data.get("location")
-
     try:
-        if le_location is None:
-            raise ValueError("Location encoder not available")
-        encoded = le_location.transform([location])[0]
-        result = df[df["location_encoded"] == encoded].drop(columns=["location_encoded"])
-        # Convert to records then replace NaN with None for JSON compatibility
+        data = request.json
+        if not data:
+            return jsonify({"message": "No data provided"}), 400
+        
+        location = data.get("location", "").strip()
+        if not location:
+            return jsonify({"message": "Location required"}), 400
+
+        if le_location is None or df.empty:
+            return jsonify({"message": "Historical data not available"}), 503
+        
+        print(f"Searching for location: '{location}'")
+        
+        # Try exact match first (case-insensitive)
+        try:
+            encoded = le_location.transform([location])[0]
+            matched_location = location
+        except:
+            # Fuzzy match - find states containing the search term
+            matching_locations = [loc for loc in le_location.classes_ if location.lower() in loc.lower()]
+            
+            if not matching_locations:
+                available = ", ".join(list(le_location.classes_)[:5])
+                return jsonify({"message": f"No data for '{location}'. Try: {available}, etc."}), 404
+            
+            matched_location = matching_locations[0]
+            encoded = le_location.transform([matched_location])[0]
+        
+        print(f"Matched '{location}' to '{matched_location}'")
+        
+        # Get data using State column if available, otherwise location_encoded
+        if 'State' in df.columns:
+            result = df[df['State'] == matched_location]
+        else:
+            result = df[df["location_encoded"] == encoded]
+        
+        if result.empty:
+            return jsonify({"message": f"No historical disasters for '{location}'"}), 404
+        
+        # Drop encoded column if exists
+        if 'location_encoded' in result.columns:
+            result = result.drop(columns=["location_encoded"])
+        
+        # Convert to records and clean NaN values
         raw = result.to_dict(orient="records")
         cleaned = []
         for rec in raw:
@@ -54,12 +105,25 @@ def get_location_data():
                 if pd.isna(v):
                     cleaned_rec[k] = None
                 else:
-                    cleaned_rec[k] = v
+                    cleaned_rec[k] = int(v) if isinstance(v, (int, float)) and k in ["Start Year", "Total Deaths"] else v
             cleaned.append(cleaned_rec)
+        
+        print(f"Returning {len(cleaned)} disaster records for '{matched_location}'")
         return jsonify(cleaned)
 
-    except Exception:
-        return jsonify({"message": "Location not found"})
+    except Exception as e:
+        print(f"Error in get_location_data: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"message": "Internal server error"}), 500
+
+
+@app.route("/locations", methods=["GET"])
+def get_locations():
+    """List all available locations in the dataset"""
+    if le_location is None:
+        return jsonify({"message": "No locations available"}), 503
+    return jsonify({"locations": sorted(list(le_location.classes_))})
 
 
 # Frontend expects /disaster and /modules — provide simple endpoints
@@ -115,23 +179,23 @@ def weather_history():
 @app.route("/disaster-prediction", methods=["GET", "POST"])
 def disaster_prediction():
     """Predict disaster risk based on location and weather."""
-    # Get location from query or JSON
-    if request.method == "POST":
-        data = request.json or {}
-        loc = data.get("location")
-        temp = data.get("temp")
-        humidity = data.get("humidity")
-        wind = data.get("wind")
-    else:
-        loc = request.args.get("location")
-        temp = request.args.get("temp")
-        humidity = request.args.get("humidity")
-        wind = request.args.get("wind")
-    
-    if not loc:
-        return jsonify({"message": "location required"}), 400
-    
     try:
+        # Get location from query or JSON
+        if request.method == "POST":
+            data = request.json or {}
+            loc = data.get("location")
+            temp = data.get("temp")
+            humidity = data.get("humidity")
+            wind = data.get("wind")
+        else:
+            loc = request.args.get("location")
+            temp = request.args.get("temp")
+            humidity = request.args.get("humidity")
+            wind = request.args.get("wind")
+        
+        if not loc:
+            return jsonify({"message": "location required"}), 400
+        
         # Fetch real-time weather if not provided
         if temp is None or humidity is None or wind is None:
             weather_data = get_weather(loc)
@@ -143,7 +207,7 @@ def disaster_prediction():
             humidity = int(humidity)
             wind = float(wind)
         
-        # Encode location if available
+        # Use heuristic prediction
         location_encoded = 0
         if le_location is not None:
             try:
@@ -151,12 +215,7 @@ def disaster_prediction():
             except:
                 location_encoded = 0
         
-        # Get AI prediction using XGBoost
-        prediction = predict_with_xgboost(temp, humidity, wind)
-        
-        if prediction is None:
-            # Fallback to heuristic model
-            prediction = predict_disaster_risk(location_encoded, temp, humidity, wind)
+        prediction = predict_disaster_risk(location_encoded, temp, humidity, wind)
         
         # Add weather data to response
         prediction["weather_data"] = {
@@ -168,6 +227,7 @@ def disaster_prediction():
         
         return jsonify(prediction)
     except Exception as e:
+        print(f"Error in disaster_prediction: {e}")
         return jsonify({"message": str(e)}), 500
 
 
